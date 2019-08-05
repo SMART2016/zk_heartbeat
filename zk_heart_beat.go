@@ -8,73 +8,118 @@ import (
 	"github.com/samuel/go-zookeeper/zk"
 )
 
-type HeartbeatChangeHandler func(zk.Event)
+var connection1 *zk.Conn
 
-type HeartBeatInstance struct {
-	conf                  config.HeartBeatConfig
-	parentHeartBeatPath   string
-	connection            *zk.Conn
-	watchHeartbeatChannel <-chan zk.Event
-	heartbeatHandler      HeartbeatChangeHandler
+//Custom function that the service will implement to handle hearbeat eventsand new node registration
+type HeartbeatChangeHandler func(zk.Event)
+type NodeRegisterHandler func(zk.Event)
+
+type Controller interface {
+	RegisterServiceHeartBeat(string, string) ([]string, []string, error)
 }
 
-//Every Service instance cal call this function to register there Heartbeat functionality to Zookeeper
+type HeartBeatController struct {
+	conf                    config.HeartBeatConfig
+	parentHeartBeatPath     string
+	suppParentPath          string
+	connection              *zk.Conn
+	heartbeatChannel        <-chan zk.Event
+	nodeRegChannel          <-chan zk.Event
+	heartbeatHandler        HeartbeatChangeHandler
+	nodeRegistrationHandler NodeRegisterHandler
+	totalRegisteredNodes    []string
+	totalLiveNodes          []string
+}
+
+func GetHeartBeatController(heartBeatConf config.HeartBeatConfig) Controller {
+	controller := &HeartBeatController{
+		conf:                    heartBeatConf,
+		heartbeatHandler:        handleHearBeat,
+		nodeRegistrationHandler: handleNewNodeRegistration,
+	}
+
+	return controller
+}
+
+//HeartBeat Interface Function: Every Service instance cal call this function to register there Heartbeat functionality to Zookeeper
 //The Heartbeat will be bounded to a single zookeeper persistent parent node based on the service name.
 //The entire service cluster should be having same service name to leverage Heartbeat properly.
 //pathID: any identifier which will uniquely identify the instance like IP or PodId
-func (h HeartBeatInstance) RegisterServiceHeartBeat(pathID, data string) ([]string, error) {
+func (h HeartBeatController) RegisterServiceHeartBeat(pathID, data string) ([]string, []string, error) {
 	//Get ZK connection
 	if err := h.connect(); err != nil {
-		return nil, fmt.Errorf("Error Getting zk cluster Connection. Reason: %v", err)
+		return nil, nil, fmt.Errorf("Error Getting zk cluster Connection. Reason: %v", err)
 	}
+	h.connection = connection1
 
-	//Create Persistent Parent Node
+	//Create Persistent Parent Node to hold live service nodes as colatile nodes and the child nodes will go away as the client is disconnected from ZK
 	if _, err := h.createParentNode("/"+h.conf.ServiceName, h.conf.ServiceName); err != nil {
-		return nil, fmt.Errorf("Error Creating Parent zk HeartBeat Node. Reason: %v", err)
+		return nil, nil, fmt.Errorf("Error Creating Parent zk HeartBeat Node. Reason: %v", err)
 	} else {
 		h.parentHeartBeatPath = "/" + h.conf.ServiceName
+		h.suppParentPath = h.parentHeartBeatPath + "_childinfo"
 	}
 
-	//Create a child empheral node for the current instance to register to heatbeat contract.
+	//Create a child empheral node for the current instance to register to heatbeat contract.This is a volatile zk node
 	if _, err := h.createChildEmpheralNode(pathID, data); err != nil {
-		return nil, fmt.Errorf("Error creating child Empheral node for current instance hearbeat. Reason: %v", err)
+		return nil, nil, fmt.Errorf("Error creating child Empheral node for current instance hearbeat. Reason: %v", err)
 	}
 
-	registeredNodes, err := h.getRegisteredNodeInfo()
+	//Watch on the Parent hearbeat node and the supplimentary registration node to get the current live nodes and the total actual registered nodes.
+	registeredLiveNodes, registeredTotalNodes, err := h.getRegisteredNodeInfo()
 	if err != nil {
-		return nil, fmt.Errorf("Error Fetching Registered nodes for the Parent Hearbeat node [ %s ]... Reason: %v", h.parentHeartBeatPath, err)
+		return nil, nil, fmt.Errorf("Error Fetching Registered nodes for the Parent Hearbeat node [ %s ]... Reason: %v", h.parentHeartBeatPath, err)
 	}
 
-	//TODO heartbeat watcher to be started  to listen on h.watchHeartbeatChannel
+	//TODO heartbeat watcher to be started  to listen on h.heartbeatChannel and h.nodeRegChannel
+	go h.watchHeartBeat()
+	go h.watchNodeRegistration()
 
-	return registeredNodes, nil
+	return registeredLiveNodes, registeredTotalNodes, nil
 }
 
-func (h HeartBeatInstance) getRegisteredNodeInfo() ([]string, error) {
-	var registeredNodes []string
+//This method returns the heartbeat channel to which the current node should listen, to identify if any change happened in other service nodes in the cluster.
+//When called for the first time its also returns the current live nodes registered for the service cluster.
+func (h HeartBeatController) getRegisteredNodeInfo() ([]string, []string, error) {
+
+	//Getting the current live node info
 	found, _, err := h.connection.Exists(h.parentHeartBeatPath)
 	if found {
-		registeredNodes, _, heartbeatChannel, err := h.connection.ChildrenW(h.parentHeartBeatPath) //[]string, *Stat, <-chan Event, error
+		registeredLiveNodes, _, heartbeatChannel, err := h.connection.ChildrenW(h.parentHeartBeatPath) //[]string, *Stat, <-chan Event, error
 		if err != nil {
-			return nil, fmt.Errorf("Failed to fetch Registered Nodes for the Parent Hearbeat node [ %s ]... Reason: %v", h.parentHeartBeatPath, err)
+			return nil, nil, fmt.Errorf("Failed to fetch Registered Nodes for the Parent Hearbeat node [ %s ]... Reason: %v", h.parentHeartBeatPath, err)
 		}
-		h.watchHeartbeatChannel = heartbeatChannel
-		registeredNodes = registeredNodes
+		h.heartbeatChannel = heartbeatChannel
+		h.totalLiveNodes = registeredLiveNodes
+
+		//Getting info for the total number of nodes registered for the service cluster
+		foundSupp, _, err := h.connection.Exists(h.suppParentPath)
+		if foundSupp {
+			registeredActualNodes, _, actualNodeRegChannel, err := h.connection.ChildrenW(h.parentHeartBeatPath) //[]string, *Stat, <-chan Event, error
+			if err != nil {
+				return nil, nil, fmt.Errorf("Failed to fetch Registered Nodes for the Parent Hearbeat node [ %s ]... Reason: %v", h.parentHeartBeatPath, err)
+			}
+			h.nodeRegChannel = actualNodeRegChannel
+			h.totalRegisteredNodes = registeredActualNodes
+		} else {
+			return nil, nil, fmt.Errorf("Unable to find the path for the Suuplementary Parent Hearbeat node [ %s ]... Reason: %v", h.suppParentPath, err)
+		}
+
 	} else {
-		return nil, fmt.Errorf("Unable to find the path for the Parent Hearbeat node [ %s ]... Reason: %v", h.parentHeartBeatPath, err)
+		return nil, nil, fmt.Errorf("Unable to find the path for the Parent Hearbeat node [ %s ]... Reason: %v", h.parentHeartBeatPath, err)
 	}
-	return registeredNodes, nil
+	return h.totalLiveNodes, h.totalRegisteredNodes, nil
 }
 
 //Acquiring connection with the zookeeper cluster
-func (h HeartBeatInstance) connect() error {
-	if (h.connection == &zk.Conn{}) {
+func (h HeartBeatController) connect() error {
+	if h.connection == nil {
 		conn, _, err := zk.Connect(h.conf.Servers, (time.Duration(h.conf.SessionTimeoutInSecond) * time.Second))
 
 		if err != nil {
 			return err
 		}
-		h.connection = conn
+		connection1 = conn
 	}
 	return nil
 }
@@ -82,7 +127,7 @@ func (h HeartBeatInstance) connect() error {
 //Create a persistent Parent Node based on the service name from the configuration
 //Parent Node will be persistent and will not be removed based on any service node going down
 //TODO It will also create a supplimentary Node to keep track of all the services nodes that registered at any point in time
-func (h HeartBeatInstance) createParentNode(path, data string) (*zk.Stat, error) {
+func (h HeartBeatController) createParentNode(path, data string) (*zk.Stat, error) {
 	acl := zk.WorldACL(zk.PermAll)
 
 	found, s, err := h.connection.Exists(path)
@@ -93,8 +138,25 @@ func (h HeartBeatInstance) createParentNode(path, data string) (*zk.Stat, error)
 
 	if !found {
 		_, err = h.connection.Create(path, []byte(data), 0, acl)
+		if err != nil {
+			return nil, fmt.Errorf("Error creating path: %s... Reason: %v", path, err)
+		}
+		supplParentPath := path + "_childinfo"
+		found, s, err = h.connection.Exists(supplParentPath)
+		if err != nil {
+			return nil, err
+		}
 
+		if !found {
+			suppParentNodeData := ""
+			_, err = h.connection.Create(supplParentPath, []byte(suppParentNodeData), 0, acl)
+			if err != nil {
+				return nil, fmt.Errorf("Error creating supplimentary Parent info path: %s... Reason: %v", supplParentPath, err)
+			}
+
+		}
 	}
+
 	return s, err
 }
 
@@ -102,28 +164,68 @@ func (h HeartBeatInstance) createParentNode(path, data string) (*zk.Stat, error)
 //Child Node is empheral which means that the node created will exist only till the zookeeper client/ Current service instance
 // is attached and live.
 //TODO It will also add child nodes to the supplimentatry parent node for tracking registered nodes.
-func (h HeartBeatInstance) createChildEmpheralNode(path, data string) (*zk.Stat, error) {
+func (h HeartBeatController) createChildEmpheralNode(path, data string) (*zk.Stat, error) {
 	acl := zk.WorldACL(zk.PermAll)
 	flag := int32(zk.FlagEphemeral)
-	path = h.parentHeartBeatPath + "/" + path
-	found, s, err := h.connection.Exists(path)
+	childpath := h.parentHeartBeatPath + "/" + path
+	suppChildPath := h.suppParentPath + "/" + path
+
+	found, s, err := h.connection.Exists(childpath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Error While checking child empheral path [ %s ] for existance.. Reason: %v", path, err)
 	}
 
 	if !found {
-		_, err = h.connection.Create(path, []byte(data), flag, acl)
+		_, err = h.connection.Create(childpath, []byte(data), flag, acl)
+		if err != nil {
+			return nil, fmt.Errorf("Error creating child empheral node for path : [ %s ].. Reason: %v", path, err)
+		}
+		found, s, err = h.connection.Exists(suppChildPath)
+		if err != nil {
+			return nil, fmt.Errorf("Error While checking Supplementary child path [ %s ] for existance.. Reason: %v", suppChildPath, err)
+		}
+		if !found {
+			suppchildNodeData := ""
+			_, err = h.connection.Create(suppChildPath, []byte(suppchildNodeData), 0, acl)
+			if err != nil {
+				return nil, fmt.Errorf("Error creating supplimentary child info path: %s... Reason: %v", suppChildPath, err)
+			}
+
+		}
 	}
 	return s, err
 }
 
-func (h HeartBeatInstance) watchHeartBeat() {
+//Watcher: to handle the heartbeat change event recieved from the Parent node
+func (h HeartBeatController) watchHeartBeat() {
+
 	for {
 		select {
-		case heartbeatEvent := <-h.watchHeartbeatChannel:
+		case heartbeatEvent := <-h.heartbeatChannel:
 			h.heartbeatHandler(heartbeatEvent)
 		default:
 
 		}
 	}
+}
+
+func handleHearBeat(hearBeatEvent zk.Event) {
+	fmt.Println("HeartbeatEvent: ", hearBeatEvent)
+}
+
+//Watcher: to handle the Registration of new nodes in the cluster
+func (h HeartBeatController) watchNodeRegistration() {
+
+	for {
+		select {
+		case registration := <-h.nodeRegChannel:
+			h.nodeRegistrationHandler(registration)
+		default:
+
+		}
+	}
+}
+
+func handleNewNodeRegistration(registerEvent zk.Event) {
+	fmt.Println("RegistrationEvent: ", registerEvent)
 }
