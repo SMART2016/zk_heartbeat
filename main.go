@@ -3,18 +3,20 @@ package main
 import (
 	"fmt"
 
-	"github.com/SMART2016/zk_heartbeat/config"
+	"github.com/ContinuumLLC/zk_heartbeat/heartbeat/config"
+	"github.com/ContinuumLLC/zk_heartbeat/heartbeat"
 )
 
 func main() {
 	conf := config.HeartBeatConfig{
-		Servers:                []string{"localhost:2181"},
-		SessionTimeoutInSecond: 20,
-		ServiceName:            "TestService",
+		Servers:                   []string{"localhost:2181"},
+		SessionTimeoutInSecond:    2,
+		ServiceName:               "TestService",
+		EventRefreshTimeInSeconds: 50,
 	}
 
-	hreatBeatController := GetHeartBeatController(conf)
-	liveNodes, registeredNodes, err := hreatBeatController.RegisterServiceHeartBeat("TestService1", `{"serviceid":"1"}`)
+	hreatBeatController := heartbeat.GetHeartBeatController(conf)
+	liveNodes, registeredNodes, err := hreatBeatController.RegisterServiceHeartBeat("TestService2", `{"serviceid":"2"}`)
 	if err != nil {
 		fmt.Println(err.Error())
 	}
